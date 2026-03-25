@@ -12,44 +12,105 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def create_test_data():
-    """创建测试数据"""
-    # 生成2年的模拟日线数据（更充分的数据量用于验证）
-    dates = pd.date_range('2022-01-01', '2023-12-31', freq='B')  # 工作日
+def create_test_data(years=5, seed=42):
+    """创建基于真实螺纹钢统计特征的模拟日线数据
+
+    模拟2019-2024年螺纹钢真实走势特征：
+    - 2019: 3300-4100区间震荡，先涨后跌
+    - 2020: 3100-3900，疫情暴跌后V型反转
+    - 2021: 4000-6200，碳中和大牛市，10月暴跌
+    - 2022: 3600-5200，震荡下行
+    - 2023: 3400-3900，低位窄幅震荡
+    - 2024: 3000-3900，持续下行
+
+    Args:
+        years: 模拟年数（从2024往前推）
+        seed: 随机种子
+    """
+    np.random.seed(seed)
+    start_year = 2025 - years
+    dates = pd.date_range(f'{start_year}-01-01', '2024-12-31', freq='B')
     n = len(dates)
 
-    # 生成价格数据（趋势+震荡+随机波动，模拟真实行情）
-    np.random.seed(42)
-    base_price = 4000
-    # 混合趋势：先涨后跌再涨，模拟真实周期
-    trend = 300 * np.sin(np.linspace(0, 2 * np.pi, n))
-    noise = np.cumsum(np.random.normal(0, 15, n))  # 随机游走
-    prices = base_price + trend + noise
-    
-    # 创建DataFrame
+    # --- 基于真实行情构造价格路径 ---
+    # 年度关键节点价格（模拟螺纹钢真实走势）
+    yearly_anchors = {
+        2019: [(1, 3400), (60, 3900), (130, 4100), (200, 3700), (244, 3500)],
+        2020: [(1, 3500), (30, 3100), (60, 3400), (180, 3700), (244, 3900)],
+        2021: [(1, 4200), (80, 5200), (140, 5000), (180, 6100), (200, 4600), (244, 4600)],
+        2022: [(1, 4500), (50, 5100), (100, 4600), (150, 4000), (200, 3800), (244, 3900)],
+        2023: [(1, 3900), (60, 3700), (120, 3600), (180, 3800), (244, 3600)],
+        2024: [(1, 3800), (60, 3900), (120, 3600), (180, 3400), (244, 3100)],
+    }
+
+    prices = np.zeros(n)
+    year_start_idx = 0
+
+    for year in range(start_year, 2025):
+        # 当年有多少个交易日
+        year_dates = dates[(dates.year == year)]
+        year_n = len(year_dates)
+        if year_n == 0:
+            continue
+
+        anchors = yearly_anchors.get(year, [(1, 3800), (244, 3800)])
+        # 插值构建价格骨架
+        anchor_days = [a[0] for a in anchors]
+        anchor_prices = [a[1] for a in anchors]
+        # 归一化到实际交易日数
+        anchor_days_norm = [int(d * year_n / 244) for d in anchor_days]
+        anchor_days_norm[-1] = year_n - 1
+
+        # 线性插值
+        year_prices = np.interp(range(year_n), anchor_days_norm, anchor_prices)
+
+        # 添加真实波动（日收益率标准差约1.2%）
+        daily_noise = np.cumsum(np.random.normal(0, 0.008, year_n)) * year_prices[0] * 0.5
+        year_prices = year_prices + daily_noise
+
+        prices[year_start_idx:year_start_idx + year_n] = year_prices
+        year_start_idx += year_n
+
+    # 截断到实际长度
+    prices = prices[:n]
+    prices = np.clip(prices, 2500, 7000)
+
+    # --- 生成OHLCV ---
+    opens = prices * (1 + np.random.normal(0, 0.004, n))
+    daily_vol = np.abs(np.diff(prices, prepend=prices[0])) / prices  # 基于价格变化的波动
+    intraday_range = np.maximum(daily_vol * 2, 0.005)  # 至少0.5%日内波动
+
+    highs = np.maximum(prices, opens) * (1 + np.random.uniform(0.001, intraday_range))
+    lows = np.minimum(prices, opens) * (1 - np.random.uniform(0.001, intraday_range))
+
+    # 成交量：波动大时放量
+    base_volume = 150000
+    vol_factor = 1 + daily_vol * 50  # 波动大则成交量大
+    volumes = (base_volume * vol_factor * np.random.uniform(0.6, 1.4, n)).astype(int)
+
     df = pd.DataFrame({
         'date': dates,
-        'open': prices + np.random.normal(0, 10, n),
-        'high': prices + np.random.uniform(0, 50, n),
-        'low': prices - np.random.uniform(0, 50, n),
-        'close': prices,
-        'volume': np.random.randint(10000, 100000, n)
+        'open': np.round(opens, 2),
+        'high': np.round(highs, 2),
+        'low': np.round(lows, 2),
+        'close': np.round(prices, 2),
+        'volume': volumes
     })
-    
+
     # 确保价格逻辑正确
-    for i in range(len(df)):
-        row = df.iloc[i]
-        df.loc[i, 'high'] = max(row['high'], row['open'], row['close'])
-        df.loc[i, 'low'] = min(row['low'], row['open'], row['close'])
-    
+    df['high'] = df[['high', 'open', 'close']].max(axis=1)
+    df['low'] = df[['low', 'open', 'close']].min(axis=1)
+
     return df
 
 def simple_backtest(data, initial_capital=100000, ma_period=20, commission=0.0003, slippage=0.001,
-                    atr_stop_multiplier=2.0):
+                    atr_stop_multiplier=2.0, max_position=10, min_stop_pct=0.01):
     """简化回测函数
 
     Args:
         atr_stop_multiplier: ATR止损倍数，默认2.0倍ATR跟踪止损
+        max_position: 最大持仓手数，防止止损太近导致仓位过大
+        min_stop_pct: 最小止损距离百分比，低于此值不开仓（说明波动太小）
     """
     logger.info("开始简化回测...")
 
@@ -118,6 +179,11 @@ def simple_backtest(data, initial_capital=100000, ma_period=20, commission=0.000
                     direction=PositionSide.LONG
                 )
                 
+                # 止损距离太小则跳过（窄幅震荡不值得做）
+                if stop_result.stop_distance_pct < min_stop_pct:
+                    equity_curve.append(capital)
+                    continue
+
                 # 计算仓位
                 position_result = risk_manager.calculate_position_size(
                     capital=capital,
@@ -126,12 +192,12 @@ def simple_backtest(data, initial_capital=100000, ma_period=20, commission=0.000
                     margin_rate=0.10,
                     contract_multiplier=10.0
                 )
-                
-                # 开仓
-                position = position_result.position_size
+
+                # 开仓（限制最大仓位）
+                position = min(position_result.position_size, max_position)
                 entry_price = current_price
                 stop_price = stop_result.stop_price
-                extreme_price = current_price  # 初始化极值为入场价
+                extreme_price = current_price
 
                 # 扣除手续费
                 commission_cost = entry_price * position * 10 * commission
@@ -147,12 +213,12 @@ def simple_backtest(data, initial_capital=100000, ma_period=20, commission=0.000
                 })
 
                 logger.info(f"做多开仓: 价格={entry_price:.2f}, 数量={position}, 止损={stop_price:.2f}")
-                
+
             elif signal == -1:  # 做空信号
                 # 计算止损
                 from risk_manager import RiskManager, PositionSide
                 risk_manager = RiskManager()
-                
+
                 # 使用前一根K线的极值
                 prev_high = signals_data.iloc[i-1]['high'] if i > 0 else row['high']
                 stop_result = risk_manager.calculate_stop_loss(
@@ -160,7 +226,12 @@ def simple_backtest(data, initial_capital=100000, ma_period=20, commission=0.000
                     prev_extreme=prev_high,
                     direction=PositionSide.SHORT
                 )
-                
+
+                # 止损距离太小则跳过
+                if stop_result.stop_distance_pct < min_stop_pct:
+                    equity_curve.append(capital)
+                    continue
+
                 # 计算仓位
                 position_result = risk_manager.calculate_position_size(
                     capital=capital,
@@ -170,11 +241,11 @@ def simple_backtest(data, initial_capital=100000, ma_period=20, commission=0.000
                     contract_multiplier=10.0
                 )
                 
-                # 开仓
-                position = -position_result.position_size  # 负值表示做空
+                # 开仓（限制最大仓位）
+                position = -min(position_result.position_size, max_position)
                 entry_price = current_price
                 stop_price = stop_result.stop_price
-                extreme_price = current_price  # 初始化极值为入场价
+                extreme_price = current_price
 
                 # 扣除手续费
                 commission_cost = entry_price * abs(position) * 10 * commission
