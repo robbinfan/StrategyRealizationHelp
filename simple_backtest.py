@@ -14,15 +14,16 @@ logger = logging.getLogger(__name__)
 
 def create_test_data():
     """创建测试数据"""
-    # 生成2023年上半年的模拟数据
-    dates = pd.date_range('2023-01-01', '2023-06-30', freq='2D')  # 2日K线
+    # 生成2年的模拟日线数据（更充分的数据量用于验证）
+    dates = pd.date_range('2022-01-01', '2023-12-31', freq='B')  # 工作日
     n = len(dates)
-    
-    # 生成价格数据（趋势+随机波动）
+
+    # 生成价格数据（趋势+震荡+随机波动，模拟真实行情）
     np.random.seed(42)
     base_price = 4000
-    trend = np.linspace(0, 200, n)  # 上升趋势
-    noise = np.cumsum(np.random.normal(0, 20, n))  # 随机游走
+    # 混合趋势：先涨后跌再涨，模拟真实周期
+    trend = 300 * np.sin(np.linspace(0, 2 * np.pi, n))
+    noise = np.cumsum(np.random.normal(0, 15, n))  # 随机游走
     prices = base_price + trend + noise
     
     # 创建DataFrame
@@ -43,29 +44,46 @@ def create_test_data():
     
     return df
 
-def simple_backtest(data, initial_capital=100000, ma_period=20, commission=0.0003, slippage=0.001):
-    """简化回测函数"""
+def simple_backtest(data, initial_capital=100000, ma_period=20, commission=0.0003, slippage=0.001,
+                    atr_stop_multiplier=2.0):
+    """简化回测函数
+
+    Args:
+        atr_stop_multiplier: ATR止损倍数，默认2.0倍ATR跟踪止损
+    """
     logger.info("开始简化回测...")
-    
+
     # 准备数据
     from data_processor import DataProcessor
     processor = DataProcessor()
-    
+
     # 计算MA
     data_with_ma = processor.calculate_ma(data, period=ma_period)
-    
+
+    # 计算ATR用于跟踪止损
+    data_with_ma = processor.calculate_atr(data_with_ma, period=14)
+
+    # 计算ADX用于趋势过滤
+    data_with_ma = processor.calculate_adx(data_with_ma, period=14)
+
     # 生成信号
     from signal_generator import SignalGenerator
     generator = SignalGenerator(ma_period=ma_period)
     signals_data = generator.generate_signals(data_with_ma)
+
+    # 启用信号过滤器：过滤掉小实体和低量的虚假信号
+    signals_data = generator.add_signal_filters(signals_data, min_body_ratio=0.3, min_volume_ratio=1.0)
     
     # 初始化回测状态
     capital = initial_capital
     position = 0  # 持仓数量
     entry_price = 0
     stop_price = 0
+    extreme_price = 0  # 持仓期间极值（做多记最高，做空记最低）
     trades = []
     equity_curve = [initial_capital]
+    cooldown = 0  # 信号冷却期计数器
+    cooldown_period = 3  # 平仓后等3根K线再开仓
     
     # 回测逻辑
     for i in range(len(signals_data)):
@@ -75,6 +93,18 @@ def simple_backtest(data, initial_capital=100000, ma_period=20, commission=0.000
         
         # 无持仓时检查信号
         if position == 0:
+            # 冷却期内不开仓
+            if cooldown > 0:
+                cooldown -= 1
+                equity_curve.append(capital)
+                continue
+
+            # ADX趋势过滤：ADX < 20 表示震荡市，不开仓
+            current_adx = row.get('adx', 0)
+            if pd.notna(current_adx) and current_adx < 20:
+                equity_curve.append(capital)
+                continue
+
             if signal == 1:  # 做多信号
                 # 计算止损
                 from risk_manager import RiskManager, PositionSide
@@ -101,11 +131,12 @@ def simple_backtest(data, initial_capital=100000, ma_period=20, commission=0.000
                 position = position_result.position_size
                 entry_price = current_price
                 stop_price = stop_result.stop_price
-                
+                extreme_price = current_price  # 初始化极值为入场价
+
                 # 扣除手续费
                 commission_cost = entry_price * position * 10 * commission
                 capital -= commission_cost
-                
+
                 trades.append({
                     'date': row['date'],
                     'type': 'BUY',
@@ -114,7 +145,7 @@ def simple_backtest(data, initial_capital=100000, ma_period=20, commission=0.000
                     'stop_price': stop_price,
                     'capital': capital
                 })
-                
+
                 logger.info(f"做多开仓: 价格={entry_price:.2f}, 数量={position}, 止损={stop_price:.2f}")
                 
             elif signal == -1:  # 做空信号
@@ -143,11 +174,12 @@ def simple_backtest(data, initial_capital=100000, ma_period=20, commission=0.000
                 position = -position_result.position_size  # 负值表示做空
                 entry_price = current_price
                 stop_price = stop_result.stop_price
-                
+                extreme_price = current_price  # 初始化极值为入场价
+
                 # 扣除手续费
                 commission_cost = entry_price * abs(position) * 10 * commission
                 capital -= commission_cost
-                
+
                 trades.append({
                     'date': row['date'],
                     'type': 'SELL',
@@ -156,24 +188,32 @@ def simple_backtest(data, initial_capital=100000, ma_period=20, commission=0.000
                     'stop_price': stop_price,
                     'capital': capital
                 })
-                
+
                 logger.info(f"做空开仓: 价格={entry_price:.2f}, 数量={abs(position)}, 止损={stop_price:.2f}")
         
         # 有持仓时检查出场条件
         else:
-            # 简化出场逻辑：K线颜色反转时平仓
+            current_atr = row.get('atr', 0)
+
             if position > 0:  # 做多持仓
-                # 收阴线时平仓
-                if row['close'] < row['open']:
-                    # 平仓
+                # 更新极值和ATR跟踪止损
+                if current_price > extreme_price:
+                    extreme_price = current_price
+                if current_atr > 0:
+                    atr_trailing = extreme_price - atr_stop_multiplier * current_atr
+                    stop_price = max(stop_price, atr_trailing)
+
+                # 出场条件：触及止损 或 收盘跌破止损价
+                should_exit = current_price <= stop_price
+
+                if should_exit:
                     exit_price = current_price
                     pnl = (exit_price - entry_price) * position * 10
                     capital += pnl
-                    
-                    # 扣除手续费
+
                     commission_cost = exit_price * abs(position) * 10 * commission
                     capital -= commission_cost
-                    
+
                     trades.append({
                         'date': row['date'],
                         'type': 'SELL',
@@ -182,26 +222,34 @@ def simple_backtest(data, initial_capital=100000, ma_period=20, commission=0.000
                         'pnl': pnl,
                         'capital': capital
                     })
-                    
-                    logger.info(f"平多仓: 价格={exit_price:.2f}, 盈亏={pnl:.2f}")
-                    
-                    # 重置状态
+
+                    logger.info(f"平多仓: 价格={exit_price:.2f}, 盈亏={pnl:.2f}, 止损={stop_price:.2f}")
+
                     position = 0
                     entry_price = 0
                     stop_price = 0
-                    
+                    extreme_price = 0
+                    cooldown = cooldown_period
+
             elif position < 0:  # 做空持仓
-                # 收阳线时平仓
-                if row['close'] > row['open']:
-                    # 平仓
+                # 更新极值和ATR跟踪止损
+                if current_price < extreme_price:
+                    extreme_price = current_price
+                if current_atr > 0:
+                    atr_trailing = extreme_price + atr_stop_multiplier * current_atr
+                    stop_price = min(stop_price, atr_trailing)
+
+                # 出场条件：触及止损 或 收盘突破止损价
+                should_exit = current_price >= stop_price
+
+                if should_exit:
                     exit_price = current_price
                     pnl = (entry_price - exit_price) * abs(position) * 10
                     capital += pnl
-                    
-                    # 扣除手续费
+
                     commission_cost = exit_price * abs(position) * 10 * commission
                     capital -= commission_cost
-                    
+
                     trades.append({
                         'date': row['date'],
                         'type': 'BUY',
@@ -210,13 +258,14 @@ def simple_backtest(data, initial_capital=100000, ma_period=20, commission=0.000
                         'pnl': pnl,
                         'capital': capital
                     })
-                    
-                    logger.info(f"平空仓: 价格={exit_price:.2f}, 盈亏={pnl:.2f}")
-                    
-                    # 重置状态
+
+                    logger.info(f"平空仓: 价格={exit_price:.2f}, 盈亏={pnl:.2f}, 止损={stop_price:.2f}")
+
                     position = 0
                     entry_price = 0
                     stop_price = 0
+                    extreme_price = 0
+                    cooldown = cooldown_period
         
         # 记录权益曲线
         equity_curve.append(capital)

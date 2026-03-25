@@ -22,55 +22,61 @@ class DataProcessor:
         self.resample_config = RESAMPLE_CONFIG
     
     def create_2day_kline(self, df: pd.DataFrame) -> pd.DataFrame:
-        """将日K线合成为2日K线
-        
+        """将日K线合成为2日K线（按交易日配对）
+
         合成规则：
+        - 按交易日顺序两两配对（第1-2日、第3-4日...），而非按自然日resample
         - Open: 两日中第一根的开盘价
         - High: 两日中的最高价
         - Low: 两日中的最低价
         - Close: 两日中最后一根的收盘价
         - Volume: 两日成交量之和
         - Amount: 两日成交金额之和（如果有）
-        
+
         Args:
             df: 日K线数据DataFrame，必须包含['date', 'open', 'high', 'low', 'close', 'volume']
-            
+
         Returns:
             2日K线数据DataFrame
         """
-        logger.info("开始合成2日K线数据...")
-        
+        logger.info("开始合成2日K线数据（按交易日配对）...")
+
         # 验证输入数据
         required_columns = ['date', 'open', 'high', 'low', 'close', 'volume']
         if not all(col in df.columns for col in required_columns):
             raise ValueError(f"输入数据必须包含列: {required_columns}")
-        
-        # 确保日期格式正确
+
+        # 确保日期格式正确并按日期排序
+        df = df.copy()
         df['date'] = pd.to_datetime(df['date'])
         df = df.sort_values('date').reset_index(drop=True)
-        
-        # 设置日期为索引
-        df_indexed = df.set_index('date')
-        
-        # 使用resample进行2日K线合成
-        aggregation_rules = self.resample_config['aggregation_rules'].copy()
-        
-        # 只保留数据中存在的列
-        available_columns = [col for col in aggregation_rules.keys() if col in df_indexed.columns]
-        aggregation_rules = {col: aggregation_rules[col] for col in available_columns}
-        
-        # 执行重采样
-        resampled = df_indexed.resample('2D').agg(aggregation_rules)
-        
-        # 删除空行（节假日等）
-        resampled = resampled.dropna()
-        
-        # 重置索引
-        resampled = resampled.reset_index()
-        
+
+        # 按交易日顺序两两配对合成
+        rows = []
+        for i in range(0, len(df) - 1, 2):
+            day1 = df.iloc[i]
+            day2 = df.iloc[i + 1]
+
+            row = {
+                'date': day1['date'],  # 使用第一天的日期
+                'open': day1['open'],
+                'high': max(day1['high'], day2['high']),
+                'low': min(day1['low'], day2['low']),
+                'close': day2['close'],
+                'volume': day1['volume'] + day2['volume'],
+            }
+
+            # 合成amount（如果存在）
+            if 'amount' in df.columns:
+                row['amount'] = day1['amount'] + day2['amount']
+
+            rows.append(row)
+
+        resampled = pd.DataFrame(rows)
+
         # 验证合成结果
         self._validate_resampled_data(df, resampled)
-        
+
         logger.info(f"2日K线合成完成: {len(resampled)} 条记录")
         return resampled
     
@@ -99,30 +105,101 @@ class DataProcessor:
     
     def calculate_kline_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """计算K线特征
-        
+
         Args:
             df: 数据DataFrame
-            
+
         Returns:
             添加了K线特征的DataFrame
         """
         logger.info("计算K线特征...")
-        
+
         # K线颜色（阴阳）
         df['is_red'] = df['close'] > df['open']  # 阳线
         df['is_green'] = df['close'] < df['open']  # 阴线
         df['is_doji'] = df['close'] == df['open']  # 十字星
-        
+
         # K线实体大小
         df['body_size'] = abs(df['close'] - df['open'])
         df['total_range'] = df['high'] - df['low']
         df['body_ratio'] = df['body_size'] / df['total_range']
-        
+
         # 上影线和下影线
         df['upper_shadow'] = df['high'] - df[['open', 'close']].max(axis=1)
         df['lower_shadow'] = df[['open', 'close']].min(axis=1) - df['low']
-        
+
         logger.info("K线特征计算完成")
+        return df
+
+    def calculate_atr(self, df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+        """计算ATR（平均真实波幅）
+
+        Args:
+            df: 数据DataFrame，需要有high, low, close列
+            period: ATR周期，默认14
+
+        Returns:
+            添加了atr列的DataFrame
+        """
+        logger.info(f"计算ATR{period}...")
+
+        df = df.copy()
+        prev_close = df['close'].shift(1)
+        tr = pd.concat([
+            df['high'] - df['low'],
+            (df['high'] - prev_close).abs(),
+            (df['low'] - prev_close).abs()
+        ], axis=1).max(axis=1)
+
+        df['atr'] = tr.rolling(window=period, min_periods=period).mean()
+
+        logger.info(f"ATR{period}计算完成")
+        return df
+
+    def calculate_adx(self, df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+        """计算ADX（平均趋向指标），用于判断趋势强度
+
+        ADX > 25 表示存在趋势，ADX < 20 表示震荡市
+
+        Args:
+            df: 数据DataFrame
+            period: ADX周期，默认14
+
+        Returns:
+            添加了adx列的DataFrame
+        """
+        logger.info(f"计算ADX{period}...")
+
+        df = df.copy()
+        high = df['high']
+        low = df['low']
+        close = df['close']
+
+        # 计算方向运动 +DM / -DM
+        up_move = high.diff()
+        down_move = -low.diff()
+
+        plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=df.index)
+        minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=df.index)
+
+        # 计算 True Range
+        prev_close = close.shift(1)
+        tr = pd.concat([
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs()
+        ], axis=1).max(axis=1)
+
+        # 平滑（EMA）
+        atr_smooth = tr.ewm(span=period, min_periods=period).mean()
+        plus_di = 100 * plus_dm.ewm(span=period, min_periods=period).mean() / atr_smooth
+        minus_di = 100 * minus_dm.ewm(span=period, min_periods=period).mean() / atr_smooth
+
+        # 计算 DX 和 ADX
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+        df['adx'] = dx.ewm(span=period, min_periods=period).mean()
+
+        logger.info(f"ADX{period}计算完成")
         return df
     
     def calculate_price_position(self, df: pd.DataFrame, ma_period: int = 20) -> pd.DataFrame:
